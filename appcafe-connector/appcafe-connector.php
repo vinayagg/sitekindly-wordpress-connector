@@ -2,12 +2,13 @@
 /**
  * Plugin Name: SiteKindly Website Care Connector
  * Description: Scoped snapshots and checked, recoverable content changes for owner-approved SiteKindly repairs.
- * Version: 0.3.0
+ * Version: 0.4.0
  * Requires at least: 6.6
  * Requires PHP: 8.1
  * License: GPL-2.0-or-later
  */
 defined('ABSPATH') || exit;
+require_once __DIR__ . '/contact-form7.php';
 
 function appcafe_permission() {
     return is_ssl() && is_user_logged_in() && current_user_can('edit_pages');
@@ -33,6 +34,10 @@ function appcafe_target($target) {
         !is_int($target['id']) || $target['id'] < 1) {
         return new WP_Error('invalid_target', 'Invalid content target.', array('status' => 400));
     }
+    if (($target['resource'] ?? '') === 'contact_form') {
+        $details = appcafe_cf7_details($target);
+        return is_wp_error($details) ? $details : $details['post'];
+    }
     $post = get_post($target['id']);
     if (!$post || !current_user_can('edit_post', $post->ID)) {
         return new WP_Error('forbidden_target', 'This content is unavailable to the connected user.', array('status' => 403));
@@ -45,6 +50,10 @@ function appcafe_target($target) {
     return $post;
 }
 function appcafe_value($target, $post) {
+    if (($target['resource'] ?? '') === 'contact_form') {
+        $mail = get_post_meta($post->ID, '_mail', true);
+        return (string) ($mail['sender'] ?? '');
+    }
     if ($target['field'] === 'alt_text') return (string) get_post_meta($post->ID, '_wp_attachment_image_alt', true);
     return (string) ($target['field'] === 'title' ? $post->post_title : $post->post_content);
 }
@@ -134,8 +143,13 @@ function appcafe_snapshot($request) {
         $post = appcafe_target($target);
         if (is_wp_error($post)) return $post;
         $value = appcafe_value($target, $post);
-        $items[] = array('resource' => $target['resource'], 'id' => $post->ID, 'field' => $target['field'],
+        $item = array('resource' => $target['resource'], 'id' => $post->ID, 'field' => $target['field'],
             'value' => $value, 'hash' => hash('sha256', $value), 'url' => get_permalink($post->ID));
+        if ($target['resource'] === 'contact_form') {
+            $item['pageId'] = $target['pageId']; $item['contextHash'] = $target['contextHash'];
+            $item['url'] = get_permalink($target['pageId']);
+        }
+        $items[] = $item;
     }
     return appcafe_response(array('items' => $items));
 }
@@ -158,7 +172,10 @@ function appcafe_patch($request) {
         $key = $change['resource'] . ':' . $change['id'] . ':' . $change['field'];
         if (isset($seen[$key])) return new WP_Error('duplicate_target', 'Each field can appear only once.', array('status' => 400));
         $seen[$key] = true;
-        if ($change['field'] !== 'content' && ($change['after'] !== wp_strip_all_tags($change['after']) || strlen($change['after']) > 1000)) {
+        if ($change['resource'] === 'contact_form' && (!trim($change['after']) || strlen($change['after']) > 500 || preg_match('/[\x00-\x1f\x7f]/', $change['after']))) {
+            return new WP_Error('invalid_sender', 'Use a single-line sender value without control characters.', array('status' => 400));
+        }
+        if ($change['field'] !== 'content' && $change['resource'] !== 'contact_form' && ($change['after'] !== wp_strip_all_tags($change['after']) || strlen($change['after']) > 1000)) {
             return new WP_Error('invalid_text', 'Titles and image alternatives must be plain text.', array('status' => 400));
         }
         if ($change['field'] === 'content' && $post->post_content !== $change['after'] && $change['after'] !== wp_kses_post($change['after']) &&
@@ -166,6 +183,12 @@ function appcafe_patch($request) {
             return new WP_Error('unsafe_markup', 'The content contains unsupported markup.', array('status' => 422));
         }
         $ids[] = $post->ID;
+        if ($change['resource'] === 'contact_form') $ids[] = $change['pageId'];
+    }
+    foreach ($changes as $change) if ($change['resource'] === 'contact_form') {
+        foreach ($changes as $other) if ($other['resource'] === 'page' && $other['id'] === $change['pageId']) {
+            return new WP_Error('conflicting_form_page', 'Review form delivery separately from changes to its public page.', array('status' => 422));
+        }
     }
     $ids = array_values(array_unique($ids)); sort($ids);
     if ($wpdb->query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ') === false ||
@@ -191,7 +214,12 @@ function appcafe_patch($request) {
         foreach ($changes as $change) {
             $current = appcafe_value($change, get_post($change['id']));
             if ($current === $change['after']) continue; // Safe retry after a lost response.
-            if ($change['field'] === 'alt_text') {
+            if ($change['resource'] === 'contact_form') {
+                $mail = get_post_meta($change['id'], '_mail', true);
+                $mail['sender'] = $change['after'];
+                $saved = update_post_meta($change['id'], '_mail', wp_slash($mail));
+                if ($saved === false) throw new RuntimeException('write_failed');
+            } elseif ($change['field'] === 'alt_text') {
                 $saved = update_post_meta($change['id'], '_wp_attachment_image_alt', wp_slash($change['after']));
                 if ($saved === false) throw new RuntimeException('write_failed');
             } else {
@@ -209,7 +237,15 @@ function appcafe_patch($request) {
         return new WP_Error('patch_not_applied', 'The change could not be applied as reviewed. Refresh the website snapshot.', array('status' => 409));
     }
     foreach ($ids as $id) clean_post_cache($id);
-    return appcafe_response(array('applied' => true, 'count' => count($changes)));
+    $warnings_refreshed = true;
+    foreach ($changes as $change) if ($change['resource'] === 'contact_form' && class_exists('WPCF7_ConfigValidator')) {
+        // Refresh derived warnings after commit; never re-save the form's other properties.
+        try {
+            $validator = new WPCF7_ConfigValidator(wpcf7_contact_form($change['id']));
+            $validator->validate(); $validator->save();
+        } catch (Throwable $error) { $warnings_refreshed = false; }
+    }
+    return appcafe_response(array('applied' => true, 'count' => count($changes), 'configurationWarningsRefreshed' => $warnings_refreshed));
 }
 function appcafe_render_preview($request) {
     $changes = $request->get_param('changes');
@@ -306,10 +342,12 @@ add_action('init', function () {
 add_action('rest_api_init', function () {
     register_rest_route('appcafe/v1', '/status', array(
         'methods' => 'GET', 'permission_callback' => 'appcafe_permission',
-        'callback' => function () { return appcafe_response(array('version' => '0.3.0', 'atomicPatch' => appcafe_transactional_tables(), 'canEdit' => current_user_can('edit_pages'), 'maxChanges' => 3, 'formLabelPreview' => true, 'renderedPreview' => true)); },
+        'callback' => function () { return appcafe_response(array('version' => '0.4.0', 'atomicPatch' => appcafe_transactional_tables(), 'canEdit' => current_user_can('edit_pages'), 'maxChanges' => 3, 'formLabelPreview' => true, 'renderedPreview' => true, 'formSenderDelivery' => appcafe_cf7_available())); },
     ));
     register_rest_route('appcafe/v1', '/snapshot', array('methods' => 'POST', 'permission_callback' => 'appcafe_permission', 'callback' => 'appcafe_snapshot'));
     register_rest_route('appcafe/v1', '/label-preview', array('methods' => 'POST', 'permission_callback' => 'appcafe_permission', 'callback' => 'appcafe_form_label_preview'));
     register_rest_route('appcafe/v1', '/render-preview', array('methods' => 'POST', 'permission_callback' => 'appcafe_permission', 'callback' => 'appcafe_render_preview'));
     register_rest_route('appcafe/v1', '/patch', array('methods' => 'POST', 'permission_callback' => 'appcafe_permission', 'callback' => 'appcafe_patch'));
+    register_rest_route('appcafe/v1', '/form-info', array('methods' => 'POST', 'permission_callback' => 'appcafe_permission', 'callback' => 'appcafe_cf7_info'));
+    register_rest_route('appcafe/v1', '/form-test', array('methods' => 'POST', 'permission_callback' => 'appcafe_permission', 'callback' => 'appcafe_cf7_test'));
 });
